@@ -1,0 +1,104 @@
+name: Build AHOS APK
+
+on:
+  push:
+    branches: [main]
+    paths: ['*.zip']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Unzip the project (the zip stays zipped in the repo)
+        run: |
+          ZIP=$(ls -1 *.zip 2>/dev/null | head -1)
+          if [ -z "$ZIP" ]; then echo "::error::No .zip file at the repo root"; exit 1; fi
+          mkdir -p src
+          unzip -q -o "$ZIP" -d src
+          PKG=$(find src -maxdepth 3 -name package.json -not -path "*/node_modules/*" | head -1)
+          if [ -z "$PKG" ]; then echo "::error::package.json not found inside the zip"; exit 1; fi
+          echo "APP=$(dirname "$PKG")" >> "$GITHUB_ENV"
+
+      - name: Read version and check release
+        id: v
+        run: |
+          cd "$APP"
+          node -e "global.window={};require('./www/version.js');const v=window.AHOS_VER,fs=require('fs');fs.appendFileSync(process.env.GITHUB_OUTPUT,'code='+v.code+'\nname='+v.name+'\n');fs.writeFileSync(process.env.GITHUB_WORKSPACE+'/notes.txt',v.notes.ar.map(x=>'• '+x).join('\n')+'\n\n'+v.notes.en.map(x=>'• '+x).join('\n'))"
+          CODE=$(node -e "global.window={};require('./www/version.js');console.log(window.AHOS_VER.code)")
+          if gh release view "v$CODE" >/dev/null 2>&1; then
+            echo "exists=1" >> "$GITHUB_OUTPUT"
+            echo "Release v$CODE already exists. Raise the code in www/version.js to publish a new update."
+          fi
+
+      - name: Prepare app files
+        if: steps.v.outputs.exists != '1'
+        env:
+          CFG: ${{ secrets.AHOS_CONFIG_JS }}
+          SIGN_PASS: ${{ secrets.SIGN_PASS }}
+        run: |
+          if [ -z "$SIGN_PASS" ]; then echo "::error::Secret SIGN_PASS is missing (any long password). See README."; exit 1; fi
+          if [ -z "$CFG" ]; then echo "::error::Secret AHOS_CONFIG_JS is missing (the text of your Firebase config.js). See README."; exit 1; fi
+          printf '%s' "$CFG" > "$APP/www/config.js"
+          echo "window.AHOS_UPD={repo:'${{ github.repository }}'};" > "$APP/www/update-config.js"
+
+      - name: Build Android project
+        if: steps.v.outputs.exists != '1'
+        working-directory: ${{ env.APP }}
+        run: |
+          npm install --legacy-peer-deps
+          npx cap add android
+          python3 - <<'PY'
+          p='android/app/src/main/AndroidManifest.xml'
+          s=open(p,encoding='utf-8').read()
+          perms=''.join('<uses-permission android:name="android.permission.%s" />\n    ' % x for x in ['RECORD_AUDIO','CAMERA','MODIFY_AUDIO_SETTINGS','POST_NOTIFICATIONS','VIBRATE'])
+          s=s.replace('<application',perms+'<application',1)
+          open(p,'w',encoding='utf-8').write(s)
+          PY
+          sed -i "s/versionCode [0-9]*/versionCode ${{ steps.v.outputs.code }}/; s/versionName \".*\"/versionName \"${{ steps.v.outputs.name }}\"/" android/app/build.gradle
+          npx @capacitor/assets generate --android || echo "icons skipped"
+          npx cap sync android
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon
+
+      - name: Sign APK (the signing key is created once and kept encrypted in the repo)
+        if: steps.v.outputs.exists != '1'
+        env:
+          SIGN_PASS: ${{ secrets.SIGN_PASS }}
+        run: |
+          if [ -f signing/ks.enc ]; then
+            openssl enc -d -aes-256-cbc -pbkdf2 -in signing/ks.enc -out ks.jks -pass env:SIGN_PASS
+          else
+            keytool -genkeypair -keystore ks.jks -storetype PKCS12 -storepass "$SIGN_PASS" -keypass "$SIGN_PASS" -alias app -keyalg RSA -keysize 2048 -validity 36500 -dname "CN=AHOS"
+            mkdir -p signing
+            openssl enc -aes-256-cbc -pbkdf2 -salt -in ks.jks -out signing/ks.enc -pass env:SIGN_PASS
+            git config user.name "github-actions"
+            git config user.email "actions@github.com"
+            git add signing/ks.enc
+            git commit -m "Add signing key"
+            git push
+          fi
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          "$BT/zipalign" -p -f 4 "$APP/android/app/build/outputs/apk/release/app-release-unsigned.apk" aligned.apk
+          "$BT/apksigner" sign --ks ks.jks --ks-pass env:SIGN_PASS --key-pass env:SIGN_PASS --ks-key-alias app --out AHOS.apk aligned.apk
+          "$BT/apksigner" verify AHOS.apk
+
+      - name: Publish release
+        if: steps.v.outputs.exists != '1'
+        run: gh release create "v${{ steps.v.outputs.code }}" AHOS.apk --title "${{ steps.v.outputs.name }}" --notes-file notes.txt --latest
+        
